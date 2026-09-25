@@ -34,8 +34,8 @@ Omarchy crash notifications intentionally bypass DND, so Focus does not silence 
 
 ## Requirements
 
-- Omarchy Quattro with `omarchy-shell` plugins and `omarchy-crash-watch.service`; tested on **Omarchy 4.0.4-1**.
-- Python 3.10 or newer, `journalctl`, and user `systemctl`. These are standard on the tested Omarchy installation; there are **no pip packages** to install.
+- Omarchy Quattro with Quickshell plugins, `omarchy-crash-watch.service`, and `omarchy-notification-send` for digests; tested on **Omarchy 4.0.4-1**.
+- Python 3.10 or newer, `journalctl` with systemd-coredump records, and user `systemctl`. These are standard on the tested Omarchy installation; there are **no pip packages** to install.
 - A running bar widget for timely rule expiry, quiet-hour transitions, and digests. When the shell starts again, the plugin reconciles saved state.
 
 The plugin runs as your user. It reads the local coredump journal and Omarchy's recent-notification files. It does not send activity to a remote service.
