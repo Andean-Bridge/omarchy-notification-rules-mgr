@@ -14,9 +14,11 @@ import datetime as dt
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,8 @@ DROPIN_NAME = "50-omarchy-notification-rules-mgr.conf"
 PROFILE_NAMES = ("Normal", "Focus", "Presenting", "Debugging")
 MAX_RULES = 100
 MAX_JOURNAL_ROWS = 250
+MAX_JOURNAL_BYTES = 4 * 1024 * 1024
+JOURNAL_TIMEOUT_SECONDS = 15
 
 
 def default_config() -> dict[str, Any]:
@@ -324,17 +328,76 @@ def dnd_state() -> bool | None:
     return True if value == "on" else False if value == "off" else None
 
 
-def journal_rows(*, since: int | None = None, limit: int = MAX_JOURNAL_ROWS) -> list[dict[str, Any]]:
-    argv = ["journalctl", "--no-pager", "-o", "json", f"MESSAGE_ID={COREDUMP_MESSAGE_ID}"]
+def bounded_journal_output(argv: list[str], *, max_bytes: int = MAX_JOURNAL_BYTES) -> tuple[bytes, bool, bool]:
+    """Read journal output with a hard byte and time limit, including partial output."""
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    output = bytearray()
+    limited = False
+    complete = False
+    deadline = time.monotonic() + JOURNAL_TIMEOUT_SECONDS
+    try:
+        assert process.stdout is not None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                limited = True
+                break
+            chunk = os.read(process.stdout.fileno(), min(65536, max_bytes + 1 - len(output)))
+            if not chunk:
+                complete = True
+                break
+            output.extend(chunk)
+            if len(output) > max_bytes:
+                del output[max_bytes:]
+                limited = True
+                break
+        if complete:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                limited = True
+            else:
+                try:
+                    complete = process.wait(timeout=remaining) == 0
+                except subprocess.TimeoutExpired:
+                    limited = True
+                    complete = False
+        return bytes(output), limited, complete
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def journal_rows(*, since: int | None = None, until: int | None = None,
+                 limit: int = MAX_JOURNAL_ROWS) -> tuple[list[dict[str, Any]], bool]:
+    # Request one extra entry to detect a row cap. Even a caller passing zero
+    # cannot turn a quiet-hours query into an unbounded journal read.
+    limit = max(1, min(limit, MAX_JOURNAL_ROWS))
+    argv = [
+        "journalctl", "--no-pager", "-o", "json", "--reverse", "-n", str(limit + 1),
+        "--output-fields=_UID,COREDUMP_EXE,COREDUMP_COMM,COREDUMP_PID,COREDUMP_SIGNAL_NAME,__REALTIME_TIMESTAMP",
+        f"MESSAGE_ID={COREDUMP_MESSAGE_ID}",
+    ]
     if since is not None:
         argv.append(f"--since=@{since}")
-    else:
-        argv.extend(["-n", str(limit)])
-    result = run(argv, timeout=15)
-    if result.returncode:
-        return []
+    if until is not None:
+        argv.append(f"--until=@{until}")
+    output, limited, complete = bounded_journal_output(argv)
+    if not complete and not limited:
+        return [], False
+    lines = output.split(b"\n")
+    if lines[-1] == b"":
+        lines.pop()
+    elif limited:
+        # An interrupted read may end in the middle of a JSON entry.
+        lines.pop()
+    limited = limited or len(lines) > limit
     rows = []
-    for line in result.stdout.splitlines():
+    for line in lines[:limit]:
+        if not line:
+            continue
         try:
             item = json.loads(line)
             if str(item.get("_UID", "")) != str(os.getuid()):
@@ -353,7 +416,7 @@ def journal_rows(*, since: int | None = None, limit: int = MAX_JOURNAL_ROWS) -> 
             })
         except (ValueError, TypeError, json.JSONDecodeError):
             continue
-    return sorted(rows, key=lambda row: row["timestamp"], reverse=True)
+    return sorted(rows, key=lambda row: row["timestamp"], reverse=True), limited
 
 
 def recent_notifications(location: dict[str, Path]) -> list[dict[str, Any]]:
@@ -408,7 +471,7 @@ def group_crashes(rows: list[dict[str, Any]], config: dict[str, Any], now: dt.da
 
 
 def snapshot(config: dict[str, Any], state: dict[str, Any], location: dict[str, Path], now: dt.datetime) -> dict[str, Any]:
-    crashes = journal_rows()
+    crashes, _ = journal_rows()
     notifications = recent_notifications(location)
     for row in notifications:
         if row["crashProcess"]:
@@ -439,8 +502,13 @@ def expire_rules(config: dict[str, Any], now: dt.datetime) -> bool:
 
 
 def send_crash_digest(start: int, end: int) -> str:
-    rows = [row for row in journal_rows(since=start, limit=0) if row["timestamp"] < end]
+    rows, limited = journal_rows(since=start, until=end)
+    rows = [row for row in rows if row["timestamp"] < end]
     if not rows:
+        if limited:
+            run(["omarchy-notification-send", "--urgency", "low", "Crash digest",
+                 "Crash history exceeded the read limit; no complete records could be summarized"])
+            return "Quiet hours ended · crash digest limited"
         return "No crashes during quiet hours"
     grouped: dict[str, int] = {}
     for row in rows:
@@ -449,8 +517,10 @@ def send_crash_digest(start: int, end: int) -> str:
     detail = ", ".join(f"{name} ×{count}" for name, count in top)
     if len(grouped) > len(top):
         detail += f" and {len(grouped) - len(top)} more"
-    run(["omarchy-notification-send", "--urgency", "low", "Crash digest", f"{len(rows)} crashes: {detail}"])
-    return f"Quiet hours ended · {len(rows)} crashes summarized"
+    count = f"At least {len(rows)}" if limited else str(len(rows))
+    suffix = " (latest records)" if limited else ""
+    run(["omarchy-notification-send", "--urgency", "low", "Crash digest", f"{count} crashes{suffix}: {detail}"])
+    return f"Quiet hours ended · {count.lower()} crashes summarized"
 
 
 def reconcile(config: dict[str, Any], state: dict[str, Any], location: dict[str, Path], now: dt.datetime) -> str | None:

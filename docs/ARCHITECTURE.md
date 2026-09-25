@@ -23,13 +23,13 @@ The panel sends a CLI action to `backend.py` through Quickshell's `Process` API.
 
 A rule records the process, action (`silence`), profile scope, creation time, expiry time, and whether it ends with the Debugging session. Creating a new rule for the same process and scope replaces its duration. Leaving Debugging removes session rules. Expired rules are pruned by the widget's one-minute timer and at the next reconciliation after shell startup.
 
-Quiet hours use local 24-hour clock times. At the start, the plugin stores the prior DND state, turns on DND, and applies an all-crash ignore while the schedule is active. At the end it restores the prior DND state unless profile or manual DND control has taken precedence. If enabled, the digest queries coredumps recorded during that quiet window and sends one summary through `omarchy-notification-send`. The bar widget must be running for an on-time transition; an interrupted shell reconciles when it next loads.
+Quiet hours use local 24-hour clock times. At the start, the plugin stores the prior DND state, turns on DND, and applies an all-crash ignore while the schedule is active. At the end it restores the prior DND state unless profile or manual DND control has taken precedence. If enabled, the digest queries coredumps recorded during that quiet window and sends one summary through `omarchy-notification-send`. The query asks for the latest 251 entries in the window, keeps at most 250, selects only fields needed by the UI, and reads at most 4 MiB for 15 seconds. A capped digest reports its crash count as a lower bound. The bar widget must be running for an on-time transition; an interrupted shell reconciles when it next loads.
 
 Profile defaults are intentionally simple: Normal and Debugging leave DND off, Focus enables DND, and Presenting enables DND plus all-crash muting. Per-process rules can apply to all profiles or a single one.
 
 ## Activity sources
 
-- The crash inbox reads the latest 250 `systemd-coredump` journal entries and keeps only entries with the current user's UID. It groups those by executable basename and evaluates each against the plugin's current policy.
+- The crash inbox reads at most the latest 250 `systemd-coredump` journal entries and keeps only entries with the current user's UID. Its subprocess output has the same 4 MiB and 15-second caps as the digest. It groups those entries by executable basename and evaluates each against the plugin's current policy.
 - Recent notifications come from Omarchy's existing popup and short history JSON files. A card is eligible for a crash mute when its app is `omarchy-action` and its summary begins with `Process crashed: `.
 - The panel can call Omarchy's `showHistory`, `dismissAll`, and `clear` IPC methods. These operations have Omarchy's native semantics; `clear` clears archived recent history, while `dismissAll` clears visible toasts.
 

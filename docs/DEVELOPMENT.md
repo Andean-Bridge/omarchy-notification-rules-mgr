@@ -7,7 +7,7 @@
 | `manifest.json` | Omarchy plugin ID, kind, bar entry point, and default right-section placement. |
 | `Panel.qml` | Theme-aware bar icon, popup, controls, and JSON snapshot rendering. |
 | `backend.py` | Rule validation, systemd override, Omarchy IPC, journal queries, and schedule reconciliation. |
-| `tests/test_backend.py` | Isolated tests for exact matching, durations, profile scope, quiet hours, rollback, and recent crash recognition. |
+| `tests/test_backend.py` | Isolated tests for exact matching, durations, profile scope, quiet hours, rollback, bounded journal reads, and recent crash recognition. |
 
 The plugin uses Python's standard library only. Minimum Python version is 3.10 because the helper uses union type annotations.
 
@@ -28,6 +28,8 @@ python3 backend.py read | python3 -m json.tool
 ```
 
 The other CLI actions are live controls: `add`, `remove`, `profile`, `dnd`, `quiet`, `dedupe`, `capture`, `replay`, `dismiss`, and `clear`. `tick` also reconciles state and may change DND or the crash watcher. Do not run mutation actions as tests against a real desktop.
+
+Journal queries always request at most 251 entries and limit captured output to 4 MiB and 15 seconds. Keep these caps when changing the crash inbox or digest; digest counts must be marked as lower bounds whenever a cap is reached.
 
 ## Try a local checkout
 

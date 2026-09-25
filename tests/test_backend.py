@@ -1,7 +1,9 @@
 import datetime as dt
 import importlib.util
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -105,6 +107,41 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(grouped[0]["count"], 2)
         self.assertEqual(grouped[0]["policy"], "muted by rule")
         self.assertEqual(grouped[1]["policy"], "allowed")
+
+    def test_journal_query_caps_rows_and_bounds_quiet_hours(self):
+        records = b"".join(
+            (json.dumps({
+                "_UID": str(os.getuid()), "COREDUMP_EXE": "/usr/bin/MSBuild",
+                "__REALTIME_TIMESTAMP": str(index * 1_000_000),
+            }) + "\n").encode()
+            for index in range(252)
+        )
+        with patch.object(backend, "bounded_journal_output", return_value=(records, False, True)) as read:
+            rows, limited = backend.journal_rows(since=100, until=200)
+        command = read.call_args.args[0]
+        self.assertEqual(command[command.index("-n") + 1], "251")
+        self.assertIn("--since=@100", command)
+        self.assertIn("--until=@200", command)
+        self.assertEqual(len(rows), 250)
+        self.assertTrue(limited)
+
+    def test_journal_capture_has_hard_byte_limit(self):
+        output, limited, complete = backend.bounded_journal_output(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1048576)"],
+            max_bytes=1024,
+        )
+        self.assertEqual(len(output), 1024)
+        self.assertTrue(limited)
+        self.assertFalse(complete)
+
+    def test_digest_labels_limited_count_as_lower_bound(self):
+        rows = [{"name": "MSBuild", "timestamp": 150}, {"name": "MSBuild", "timestamp": 140}]
+        with patch.object(backend, "journal_rows", return_value=(rows, True)) as query, \
+             patch.object(backend, "run", side_effect=lambda argv, **kwargs: completed(argv)) as run:
+            status = backend.send_crash_digest(100, 200)
+        query.assert_called_once_with(since=100, until=200)
+        self.assertIn("At least 2 crashes", run.call_args.args[0][-1])
+        self.assertIn("at least 2", status)
 
     def test_recent_crash_alert_exposes_its_process_for_mute_actions(self):
         popups = Path(self.directory.name) / "popups"
