@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "andean-bridge.notification-rules-mgr",
+  "name": "Notification Rules",
+  "version": "0.1.0",
+  "author": "Andean Bridge",
+  "license": "MIT",
+  "description": "Silence repetitive crash alerts by executable, with timed rules, profiles, quiet hours, and activity.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Notification Rules",
+    "description": "Mute repeated MSBuild and other process crash alerts; manage profiles, quiet hours, and recent activity.",
+    "category": "System",
+    "aliases": ["notification-rules", "quiet", "crashes"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
