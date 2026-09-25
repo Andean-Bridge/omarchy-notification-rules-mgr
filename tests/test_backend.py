@@ -62,6 +62,18 @@ class RuleTests(unittest.TestCase):
             path.write_text(json.dumps({"quietHours": "22:00"}))
             with self.assertRaises(ValueError):
                 backend.read_json(path, backend.default_config())
+            path.write_text(json.dumps({"rules": ["not a rule"]}))
+            with self.assertRaisesRegex(ValueError, "Invalid rule"):
+                backend.read_json(path, backend.default_config())
+
+    def test_replacing_rule_still_works_at_the_rule_limit(self):
+        for index in range(backend.MAX_RULES):
+            backend.mutate(self.config, "add", [f"process-{index}", "silence", "hour", "All"], self.now)
+        backend.mutate(self.config, "add", ["process-0", "silence", "forever", "All"], self.now)
+        self.assertEqual(len(self.config["rules"]), backend.MAX_RULES)
+        self.assertIsNone(self.config["rules"][0]["expiresAt"])
+        with self.assertRaisesRegex(ValueError, "Rule limit reached"):
+            backend.mutate(self.config, "add", ["new-process", "silence", "hour", "All"], self.now)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -143,6 +155,20 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("At least 2 crashes", run.call_args.args[0][-1])
         self.assertIn("at least 2", status)
 
+    def test_failed_digest_send_is_reported_and_transition_status_is_preserved(self):
+        rows = [{"name": "MSBuild", "timestamp": 150}]
+        with patch.object(backend, "journal_rows", return_value=(rows, False)), \
+             patch.object(backend, "run", side_effect=lambda argv, **kwargs: completed(argv, 1)):
+            self.assertIn("could not be sent", backend.send_crash_digest(100, 200))
+        location = {**self.location, "config": Path(self.directory.name) / "config.json",
+                    "state": Path(self.directory.name) / "state.json"}
+        state = {**backend.default_state(), "quietActive": True, "quietStartedAt": 100}
+        self.config["quietHours"].update({"enabled": True, "start": "14:00", "end": "16:00"})
+        with patch.object(backend, "send_crash_digest", return_value="Quiet hours ended · 1 crash summarized"), \
+             patch.object(backend, "apply_crash_settings", return_value=True):
+            backend.reconcile(self.config, state, location, self.now.replace(hour=17))
+        self.assertEqual(state["status"], "Quiet hours ended · 1 crash summarized")
+
     def test_recent_crash_alert_exposes_its_process_for_mute_actions(self):
         popups = Path(self.directory.name) / "popups"
         history = popups / "history"
@@ -152,6 +178,54 @@ class IntegrationTests(unittest.TestCase):
         rows = backend.recent_notifications({"popups": popups, "history": history})
         self.assertEqual(rows[0]["crashProcess"], "")
         self.assertEqual(rows[1]["crashProcess"], "MSBuild")
+
+    def test_recent_notifications_bound_accumulated_history_and_large_files(self):
+        popups = Path(self.directory.name) / "popups"
+        history = popups / "history"
+        history.mkdir(parents=True)
+        for index in range(180):
+            timestamp = 1_000_000 + index * 1_000
+            (history / f"{timestamp}-{index}.json").write_text(json.dumps({
+                "app": "build", "summary": f"Alert {index}",
+                "body": "ok", "timestamp": timestamp,
+            }))
+        oversized = history / "9999999999999-999.json"
+        oversized.write_text(json.dumps({"app": "build", "body": "x" * (backend.MAX_NOTIFICATION_BYTES + 1)}))
+        (popups / "9999999999998-998.json").symlink_to(oversized)
+        with patch.object(backend, "bounded_file_bytes", wraps=backend.bounded_file_bytes) as read:
+            rows = backend.recent_notifications({"popups": popups, "history": history})
+        self.assertEqual(len(rows), backend.MAX_RECENT_NOTIFICATIONS)
+        self.assertEqual(rows[0]["summary"], "Alert 179")
+        self.assertLessEqual(read.call_count, backend.MAX_NOTIFICATION_FILES)
+        self.assertNotIn(oversized, [call.args[0] for call in read.call_args_list])
+
+    def test_recent_notification_text_is_bounded_for_panel_output(self):
+        popups = Path(self.directory.name) / "popups"
+        history = popups / "history"
+        history.mkdir(parents=True)
+        (history / "1000-1.json").write_text(json.dumps({
+            "app": "a" * 500, "summary": "s" * 1000,
+            "body": "b" * 20_000, "timestamp": 1000,
+        }))
+        rows = backend.recent_notifications({"popups": popups, "history": history})
+        self.assertEqual(len(rows[0]["app"]), backend.MAX_NOTIFICATION_APP_CHARS)
+        self.assertEqual(len(rows[0]["summary"]), backend.MAX_NOTIFICATION_SUMMARY_CHARS)
+        self.assertEqual(len(rows[0]["body"]), backend.MAX_NOTIFICATION_BODY_CHARS)
+
+    def test_settings_file_and_command_output_are_bounded(self):
+        settings = Path(self.directory.name) / "settings.json"
+        settings.write_bytes(b"x" * (backend.MAX_SETTINGS_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "read limit"):
+            backend.read_json(settings, backend.default_config())
+        with self.assertRaisesRegex(RuntimeError, "Command output exceeded"):
+            backend.run([sys.executable, "-c", "import sys; sys.stdout.write('x' * 1048576)"])
+
+    def test_oversized_crash_override_is_not_loaded(self):
+        target = self.location["dropin"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"x" * (backend.MAX_OVERRIDE_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "read limit"):
+            backend.apply_crash_settings(self.config, self.location, self.now)
 
     def test_quiet_hours_restores_previous_dnd_when_no_profile_controls_it(self):
         state = backend.default_state()

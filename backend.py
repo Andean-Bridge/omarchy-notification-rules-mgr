@@ -11,10 +11,13 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import heapq
 import json
 import os
 import re
 import select
+import selectors
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +35,15 @@ MAX_RULES = 100
 MAX_JOURNAL_ROWS = 250
 MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 JOURNAL_TIMEOUT_SECONDS = 15
+MAX_SETTINGS_BYTES = 256 * 1024
+MAX_NOTIFICATION_BYTES = 64 * 1024
+MAX_NOTIFICATION_FILES = 64
+MAX_RECENT_NOTIFICATIONS = 20
+MAX_NOTIFICATION_APP_CHARS = 128
+MAX_NOTIFICATION_SUMMARY_CHARS = 512
+MAX_NOTIFICATION_BODY_CHARS = 4096
+MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
+MAX_OVERRIDE_BYTES = 64 * 1024
 
 
 def default_config() -> dict[str, Any]:
@@ -83,12 +95,20 @@ def paths() -> dict[str, Path]:
     }
 
 
+def bounded_file_bytes(path: Path, max_bytes: int) -> bytes:
+    with path.open("rb") as source:
+        content = source.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise ValueError(f"{path} exceeds the {max_bytes}-byte read limit")
+    return content
+
+
 def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(bounded_file_bytes(path, MAX_SETTINGS_BYTES))
     except FileNotFoundError:
         return copy.deepcopy(fallback)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Cannot read {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"Invalid object in {path}")
@@ -107,6 +127,53 @@ def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
         for name, profile in (profiles or {}).items():
             if name in PROFILE_NAMES and isinstance(profile, dict):
                 merged["profiles"][name].update(profile)
+    if "rules" in fallback:
+        if merged.get("activeProfile") not in PROFILE_NAMES:
+            raise ValueError(f"Invalid active profile in {path}")
+        rules = merged.get("rules")
+        if not isinstance(rules, list) or len(rules) > MAX_RULES:
+            raise ValueError(f"Invalid rule list in {path}")
+        for rule in rules:
+            if not isinstance(rule, dict) or not isinstance(rule.get("process"), str):
+                raise ValueError(f"Invalid rule in {path}")
+            if normalize_process(rule["process"]) != rule["process"]:
+                raise ValueError(f"Invalid rule process in {path}")
+            if (not isinstance(rule.get("id"), str) or not rule["id"]
+                    or rule.get("action") != "silence"
+                    or rule.get("profile") not in ("All", *PROFILE_NAMES)
+                    or not isinstance(rule.get("untilSessionEnd"), bool)):
+                raise ValueError(f"Invalid rule in {path}")
+            expiry = rule.get("expiresAt")
+            if expiry is not None and (not isinstance(expiry, int) or isinstance(expiry, bool)):
+                raise ValueError(f"Invalid rule expiry in {path}")
+        dedupe = merged.get("dedupeSeconds")
+        if not isinstance(dedupe, int) or isinstance(dedupe, bool) or not 10 <= dedupe <= 3600:
+            raise ValueError(f"Invalid repeat window in {path}")
+        manual_dnd = merged.get("manualDnd")
+        if (not isinstance(merged.get("dndManaged"), bool)
+                or (manual_dnd is not None and not isinstance(manual_dnd, bool))):
+            raise ValueError(f"Invalid Do Not Disturb setting in {path}")
+        for profile in merged["profiles"].values():
+            if not isinstance(profile.get("dnd"), bool) or not isinstance(profile.get("muteAllCrashes"), bool):
+                raise ValueError(f"Invalid profile in {path}")
+        quiet = merged["quietHours"]
+        if (any(not isinstance(quiet.get(key), bool) for key in ("enabled", "dnd", "muteCrashes", "digest"))
+                or any(not isinstance(quiet.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", quiet[key])
+                       for key in ("start", "end"))
+                or quiet["start"] == quiet["end"]):
+            raise ValueError(f"Invalid quiet hours in {path}")
+    elif "quietActive" in fallback:
+        if not isinstance(merged.get("quietActive"), bool):
+            raise ValueError(f"Invalid quiet state in {path}")
+        for key in ("quietStartedAt",):
+            value = merged.get(key)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise ValueError(f"Invalid quiet state in {path}")
+        prior_dnd = merged.get("preQuietDnd")
+        if prior_dnd is not None and not isinstance(prior_dnd, bool):
+            raise ValueError(f"Invalid quiet state in {path}")
+        if not isinstance(merged.get("status", ""), str) or len(merged.get("status", "")) > 512:
+            raise ValueError(f"Invalid panel status in {path}")
     return merged
 
 
@@ -142,7 +209,49 @@ def write_unit_override(path: Path, value: str) -> None:
 
 
 def run(argv: list[str], *, timeout: int = 8) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    """Run a local control command without buffering unlimited output."""
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        total = 0
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            ready = selector.select(remaining)
+            if not ready:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in ready:
+                chunk = os.read(key.fileobj.fileno(), min(65536, MAX_COMMAND_OUTPUT_BYTES + 1 - total))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output[key.data].extend(chunk)
+                total += len(chunk)
+                if total > MAX_COMMAND_OUTPUT_BYTES:
+                    raise RuntimeError(f"Command output exceeded {MAX_COMMAND_OUTPUT_BYTES} bytes: {argv[0]}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return subprocess.CompletedProcess(
+            argv, process.wait(timeout=remaining),
+            output["stdout"].decode("utf-8", errors="replace"),
+            output["stderr"].decode("utf-8", errors="replace"),
+        )
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def normalize_process(value: str) -> str:
@@ -252,33 +361,43 @@ def dropin_text(pattern: str, dedupe_seconds: int) -> str | None:
 
 def external_ignore_conflicts(dropin: Path) -> list[str]:
     unit = "omarchy-crash-watch.service"
-    candidates = [
-        Path("/usr/lib/systemd/user") / unit,
-        Path("/etc/systemd/user") / unit,
-    ]
-    for directory in (
-        Path("/usr/lib/systemd/user") / f"{unit}.d",
-        Path("/etc/systemd/user") / f"{unit}.d",
-        dropin.parent,
-    ):
-        if directory.is_dir():
-            candidates.extend(directory.glob("*.conf"))
-    conflicts = []
-    for path in candidates:
+    def candidates():
+        yield Path("/usr/lib/systemd/user") / unit
+        yield Path("/etc/systemd/user") / unit
+        for directory in (
+            Path("/usr/lib/systemd/user") / f"{unit}.d",
+            Path("/etc/systemd/user") / f"{unit}.d",
+            dropin.parent,
+        ):
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if entry.name.endswith(".conf") and entry.is_file():
+                            yield Path(entry.path)
+            except OSError:
+                continue
+
+    for path in candidates():
         if path == dropin:
             continue
         try:
-            if "OMARCHY_CRASH_IGNORE" in path.read_text(encoding="utf-8"):
-                conflicts.append(str(path))
+            if b"OMARCHY_CRASH_IGNORE" in bounded_file_bytes(path, MAX_OVERRIDE_BYTES):
+                return [str(path)]
+        except ValueError:
+            # An override too large to inspect could contain the setting.
+            return [str(path)]
         except OSError:
             continue
-    return conflicts
+    return []
 
 
 def apply_crash_settings(config: dict[str, Any], location: dict[str, Path], now: dt.datetime) -> bool:
     target = location["dropin"]
     desired = dropin_text(effective_pattern(config, now), int(config["dedupeSeconds"]))
-    previous = target.read_text(encoding="utf-8") if target.exists() else None
+    try:
+        previous = bounded_file_bytes(target, MAX_OVERRIDE_BYTES).decode("utf-8")
+    except FileNotFoundError:
+        previous = None
     if desired == previous:
         return False
     if desired and external_ignore_conflicts(target):
@@ -316,7 +435,7 @@ def apply_dnd(config: dict[str, Any], now: dt.datetime) -> str | None:
 def set_dnd(wanted: bool) -> str | None:
     result = run(["omarchy-shell", "notifications", "setDnd", "on" if wanted else "off"])
     if result.returncode != 0:
-        return result.stderr.strip() or "Could not change Do Not Disturb"
+        return (result.stderr.strip() or "Could not change Do Not Disturb")[:512]
     return None
 
 
@@ -420,35 +539,60 @@ def journal_rows(*, since: int | None = None, until: int | None = None,
 
 
 def recent_notifications(location: dict[str, Path]) -> list[dict[str, Any]]:
-    rows = []
-    for directory in (location["popups"], location["history"]):
+    # Omarchy names popup files <millisecond timestamp>-<id>.json. Scan
+    # directory entries lazily and retain only the newest candidate paths.
+    candidates: list[tuple[int, int, int, Path, bool]] = []
+    sequence = 0
+    for directory, on_screen in ((location["popups"], True), (location["history"], False)):
         try:
-            files = list(directory.glob("*.json"))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    try:
+                        details = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(details.st_mode) or details.st_size > MAX_NOTIFICATION_BYTES:
+                        continue
+                    match = re.fullmatch(r"(\d+)-\d+\.json", entry.name)
+                    timestamp = int(match.group(1)) if match else details.st_mtime_ns // 1_000_000
+                    candidate = (timestamp, details.st_mtime_ns, sequence, Path(entry.path), on_screen)
+                    sequence += 1
+                    if len(candidates) < MAX_NOTIFICATION_FILES:
+                        heapq.heappush(candidates, candidate)
+                    elif candidate > candidates[0]:
+                        heapq.heapreplace(candidates, candidate)
         except OSError:
             continue
-        for path in files:
-            try:
-                item = json.loads(path.read_text(encoding="utf-8"))
-                app = str(item.get("app") or "Unknown app")
-                summary = str(item.get("summary") or "Untitled alert")
-                crash_process = ""
-                if app == "omarchy-action" and summary.startswith("Process crashed: "):
-                    try:
-                        crash_process = normalize_process(summary.removeprefix("Process crashed: "))
-                    except ValueError:
-                        pass
-                rows.append({
-                    "app": app,
-                    "summary": summary,
-                    "body": str(item.get("body") or ""),
-                    "timestamp": int(item.get("timestamp") or 0) // 1000,
-                    "onScreen": directory == location["popups"],
-                    "crashProcess": crash_process,
-                })
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    unique: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for _, _, _, path, on_screen in sorted(candidates, reverse=True):
+        try:
+            item = json.loads(bounded_file_bytes(path, MAX_NOTIFICATION_BYTES))
+            if not isinstance(item, dict):
                 continue
-    unique = {(row["app"], row["summary"], row["timestamp"]): row for row in rows}
-    return sorted(unique.values(), key=lambda row: row["timestamp"], reverse=True)[:20]
+            app = str(item.get("app") or "Unknown app")[:MAX_NOTIFICATION_APP_CHARS]
+            summary = str(item.get("summary") or "Untitled alert")[:MAX_NOTIFICATION_SUMMARY_CHARS]
+            crash_process = ""
+            if app == "omarchy-action" and summary.startswith("Process crashed: "):
+                try:
+                    crash_process = normalize_process(summary.removeprefix("Process crashed: "))
+                except ValueError:
+                    pass
+            row = {
+                "app": app,
+                "summary": summary,
+                "body": str(item.get("body") or "")[:MAX_NOTIFICATION_BODY_CHARS],
+                "timestamp": int(item.get("timestamp") or 0) // 1000,
+                "onScreen": on_screen,
+                "crashProcess": crash_process,
+            }
+            key = (row["app"], row["summary"], row["timestamp"])
+            if key not in unique or (on_screen and not unique[key]["onScreen"]):
+                unique[key] = row
+        except (OSError, ValueError, TypeError):
+            continue
+    return sorted(unique.values(), key=lambda row: row["timestamp"], reverse=True)[:MAX_RECENT_NOTIFICATIONS]
 
 
 def classify_crash(name: str, config: dict[str, Any], now: dt.datetime) -> str:
@@ -506,8 +650,10 @@ def send_crash_digest(start: int, end: int) -> str:
     rows = [row for row in rows if row["timestamp"] < end]
     if not rows:
         if limited:
-            run(["omarchy-notification-send", "--urgency", "low", "Crash digest",
-                 "Crash history exceeded the read limit; no complete records could be summarized"])
+            result = run(["omarchy-notification-send", "--urgency", "low", "Crash digest",
+                          "Crash history exceeded the read limit; no complete records could be summarized"])
+            if result.returncode:
+                return "Quiet hours ended · crash digest could not be sent"
             return "Quiet hours ended · crash digest limited"
         return "No crashes during quiet hours"
     grouped: dict[str, int] = {}
@@ -519,12 +665,15 @@ def send_crash_digest(start: int, end: int) -> str:
         detail += f" and {len(grouped) - len(top)} more"
     count = f"At least {len(rows)}" if limited else str(len(rows))
     suffix = " (latest records)" if limited else ""
-    run(["omarchy-notification-send", "--urgency", "low", "Crash digest", f"{count} crashes{suffix}: {detail}"])
+    result = run(["omarchy-notification-send", "--urgency", "low", "Crash digest", f"{count} crashes{suffix}: {detail}"])
+    if result.returncode:
+        return "Quiet hours ended · crash digest could not be sent"
     return f"Quiet hours ended · {count.lower()} crashes summarized"
 
 
 def reconcile(config: dict[str, Any], state: dict[str, Any], location: dict[str, Path], now: dt.datetime) -> str | None:
     changed = expire_rules(config, now)
+    digest_status = None
     is_quiet = quiet_active(config, now)
     was_quiet = bool(state.get("quietActive"))
     if is_quiet and not was_quiet:
@@ -534,7 +683,7 @@ def reconcile(config: dict[str, Any], state: dict[str, Any], location: dict[str,
     elif was_quiet and not is_quiet:
         started = int(state.get("quietStartedAt") or now.timestamp())
         if config["quietHours"].get("digest"):
-            state["status"] = send_crash_digest(started, int(now.timestamp()))
+            digest_status = send_crash_digest(started, int(now.timestamp()))
         state["quietStartedAt"] = None
     state["quietActive"] = is_quiet
     applied = apply_crash_settings(config, location, now)
@@ -545,6 +694,8 @@ def reconcile(config: dict[str, Any], state: dict[str, Any], location: dict[str,
         state["preQuietDnd"] = None
     if dnd_warning:
         state["status"] = dnd_warning
+    elif digest_status:
+        state["status"] = digest_status
     elif applied:
         state["status"] = "Crash watcher updated"
     if changed:
@@ -564,7 +715,8 @@ def mutate(config: dict[str, Any], action: str, args: list[str], now: dt.datetim
             raise ValueError("Crash rules support silence only")
         if profile not in ("All", *PROFILE_NAMES):
             raise ValueError("Unknown profile")
-        if len(config["rules"]) >= MAX_RULES:
+        replacing = any(rule.get("process") == process and rule.get("profile") == profile for rule in config["rules"])
+        if len(config["rules"]) >= MAX_RULES and not replacing:
             raise ValueError("Rule limit reached")
         expires_at, until_session_end = rule_expiry(duration, now)
         if until_session_end and config["activeProfile"] != "Debugging":

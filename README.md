@@ -19,7 +19,7 @@ The same workflow works for other noisy process crashes during development, such
 | More rule choices | The Rules tab also offers **Until tomorrow** (09:00 local time) and **Debug session**, plus all-profile or current-profile scope. |
 | Profiles | Switches among Normal, Focus, Presenting, and Debugging. Rules can be tied to one profile. |
 | Crash inbox | Groups and searches recent coredumps by executable; muted crashes remain visible here even when no toast was sent. |
-| Recent notifications | Searches Omarchy's short recent list. A `Process crashed: …` card from `omarchy-action` offers the four mute durations. |
+| Recent notifications | Searches Omarchy's short recent list. A `Process crashed: …` card from `omarchy-action` offers the four mute durations. The panel reads only a bounded set of recent files. |
 | Quiet hours | Enables DND and pauses crash toasts on a daily local-time schedule. An optional digest summarizes crashes when quiet hours end. |
 | Direct controls | Toggle DND or all crash capture, adjust the crash repeat window, replay recent notifications, dismiss visible toasts, and clear recent history. |
 
@@ -97,7 +97,7 @@ See [How it works](docs/ARCHITECTURE.md) for the data flow and implementation bo
 
 - Rules match **crashed executable names**, not every notification's app, title, or body. Normal and critical notification filtering would need a hook in Omarchy's notification service.
 - A muted crash is retained in the **system journal**, not Omarchy's toast history, because the watcher never sends that toast. The recent-notification list does not label items as shown or silenced.
-- Omarchy currently keeps only ten archived recent notifications. The crash inbox reads the latest 250 coredump records.
+- Omarchy currently keeps only ten archived recent notifications. The panel selects at most 64 recent notification files, reads no more than 64 KiB from each, trims displayed text, and shows up to 20 cards. Oversized files are skipped. The crash inbox reads the latest 250 coredump records.
 - The digest summarizes crashes, not all notifications; a busy or long quiet window can yield a limited, lower-bound count.
 - Rebuilding the crash watcher's environment briefly restarts it. A crash in that gap remains journaled but might not show a toast.
 - “Discard” is not offered. The plugin can stop a crash toast, but it cannot prevent systemd from recording the coredump.

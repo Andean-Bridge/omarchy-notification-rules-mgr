@@ -30,14 +30,14 @@ Profile defaults are intentionally simple: Normal and Debugging leave DND off, F
 ## Activity sources
 
 - The crash inbox reads at most the latest 250 `systemd-coredump` journal entries and keeps only entries with the current user's UID. Its subprocess output has the same 4 MiB and 15-second caps as the digest. It groups those entries by executable basename and evaluates each against the plugin's current policy.
-- Recent notifications come from Omarchy's existing popup and short history JSON files. A card is eligible for a crash mute when its app is `omarchy-action` and its summary begins with `Process crashed: `.
+- Recent notifications come from Omarchy's existing popup and short history JSON files. The helper scans directory entries lazily, retains only the 64 newest candidate paths in a heap, and reads at most 64 KiB from each selected file. It trims app, summary, and body text before returning at most 20 cards. Oversized and malformed files are skipped. A card is eligible for a crash mute when its app is `omarchy-action` and its summary begins with `Process crashed: `.
 - The panel can call Omarchy's `showHistory`, `dismissAll`, and `clear` IPC methods. These operations have Omarchy's native semantics; `clear` clears archived recent history, while `dismissAll` clears visible toasts.
 
 No local activity data is transmitted by this plugin. Installation and updates use GitHub only through Omarchy's normal `plugin add` and `plugin update` commands.
 
 ## Safety and failure behavior
 
-The helper executes subprocesses with argument arrays, without shell interpolation. It creates JSON files with mode `0600` and writes the managed systemd override atomically. If a user-manager reload or watcher restart fails, it restores the prior override and reports an error. It does not edit Omarchy's installed files.
+The helper executes subprocesses with argument arrays, without shell interpolation, and caps non-journal command output at 64 KiB. Saved settings and state reads have a 256 KiB cap; service override reads have a 64 KiB cap. Oversized or malformed settings return an error, and an override too large to inspect is treated as a conflict. It creates JSON files with mode `0600` and writes the managed systemd override atomically. If a user-manager reload or watcher restart fails, it restores the prior override and reports an error. It does not edit Omarchy's installed files.
 
 The watcher uses `journalctl -f -n 0`; restarting it creates a small interval in which a crash may not become a toast. The coredump remains in the journal. Removing the plugin folder alone leaves its managed override active, so the README includes explicit removal steps.
 
