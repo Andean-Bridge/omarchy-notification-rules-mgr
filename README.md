@@ -2,6 +2,8 @@
 
 A theme-aware bar panel for taming repetitive crash notifications while keeping useful alerts visible. It uses Omarchy's existing crash watcher, notification controls, and local activity data. It does not replace or clone Omarchy's notification service.
 
+![Notification Rules activity panel](preview.png)
+
 ## The development use case
 
 A build or debugging session can produce the same **“Process crashed: MSBuild”** toast over and over. Muting the sender `omarchy-action` would also hide unrelated Omarchy alerts. Notification Rules lets you mute the **`MSBuild` executable** for 1 hour, 8 hours, 7 days, or forever. Other crash alerts continue, and the MSBuild coredumps remain searchable in the crash inbox.
